@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0
+
+- Configure 1–16 concurrent tasks (default 3); lowering the limit never interrupts running tasks.
+- Add bilingual dashboard settings for concurrency, per-task HTTP rate defaults, directory, notifications, and mirrors.
+- Apply HTTP rate changes live; task overrides support returning to the default.
+- Persist settings atomically to `~/.config/opencode/downloader.json`.
+- Keep Ollama optional and explicitly exclude it from HTTP rate controls.
+- Add regression coverage for scheduling, settings validation, persistence, and live rate changes.
+
 ## 1.1.0
 
 - Protect completed files and reject overlapping downloads.

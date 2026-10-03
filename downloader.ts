@@ -14,7 +14,7 @@
  *   dl.open    在浏览器打开 GUI 面板
  *   dl.config  查看/修改配置（下载目录、自动通知、镜像）
  */
-import { createWriteStream, existsSync, mkdirSync, linkSync, unlinkSync } from "node:fs"
+import { createWriteStream, existsSync, mkdirSync, linkSync, unlinkSync, readFileSync, writeFileSync, renameSync } from "node:fs"
 import { createHash, randomUUID } from "node:crypto"
 import { join, basename, resolve } from "node:path"
 import { homedir, tmpdir } from "node:os"
@@ -34,7 +34,31 @@ function logNotify(s: string) {
 
 const GUI_PORT = 17890
 const DEFAULT_DIR = join(homedir(), "Downloads", "opencode-dl")
-const MAX_CONCURRENT = 3
+const CONFIG_FILE = process.env.OPENCODE_DOWNLOADER_CONFIG || join(homedir(), ".config", "opencode", "downloader.json")
+
+function validateSettings(input: any) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid settings")
+  const next: any = {}
+  for (const key of Object.keys(input)) {
+    if (!["dir", "auto_notify", "auto_mirror", "max_mbps", "max_concurrent"].includes(key)) throw new Error(`Unknown setting: ${key}`)
+  }
+  if (input.dir !== undefined) {
+    if (typeof input.dir !== "string" || !input.dir.trim()) throw new Error("Directory is required")
+    next.dir = resolve(input.dir)
+  }
+  for (const [external, internal] of [["auto_notify", "autoNotify"], ["auto_mirror", "autoMirror"]]) {
+    if (input[external] !== undefined) {
+      if (typeof input[external] !== "boolean") throw new Error(`Invalid ${external}`)
+      next[internal] = input[external]
+    }
+  }
+  if (input.max_mbps !== undefined) { rate(input.max_mbps); next.maxMbps = input.max_mbps }
+  if (input.max_concurrent !== undefined) {
+    if (!Number.isInteger(input.max_concurrent) || input.max_concurrent < 1 || input.max_concurrent > 16) throw new Error("Concurrency must be an integer from 1 to 16")
+    next.maxConcurrent = input.max_concurrent
+  }
+  return next
+}
 
 type Status = "queued" | "downloading" | "verifying" | "done" | "failed" | "canceled"
 
@@ -68,7 +92,7 @@ function validName(name: string) {
 }
 
 function rate(value: number) {
-  if (!Number.isFinite(value) || value < 0) throw new Error("限速必须是非负有限数 / Rate must be finite and nonnegative")
+  if (!Number.isFinite(value) || value < 0 || !Number.isFinite(value * 1024 * 1024)) throw new Error("限速必须是非负有限数 / Rate must be finite and nonnegative")
   return value * 1024 * 1024
 }
 
@@ -119,10 +143,44 @@ export default {
       autoNotify: true,
       autoMirror: true,
       guiPort: GUI_PORT,
-      maxMbps: 0, // 0 = 不限速；>0 = 全局限速（MB/s）
+      maxMbps: 0, // Default per-HTTP-task limit in MiB/s, not aggregate bandwidth.
+      maxConcurrent: 3,
     })
+    cfg.maxConcurrent ??= 3
+    if (!store.settingsLoaded) {
+      try {
+        if (existsSync(CONFIG_FILE)) Object.assign(cfg, validateSettings(JSON.parse(readFileSync(CONFIG_FILE, "utf8"))))
+      } catch (error: any) { logNotify(`Settings load failed: ${error.message}`) }
+      store.settingsLoaded = true
+    }
     const tasks: Map<string, Task> = store.tasks
     const controllers: Map<string, AbortController> = store.controllers
+
+    function settings() {
+      return { dir: cfg.dir, auto_notify: cfg.autoNotify, auto_mirror: cfg.autoMirror, max_mbps: cfg.maxMbps, max_concurrent: cfg.maxConcurrent }
+    }
+
+    function configure(input: any) {
+      const patch = validateSettings(input)
+      if (!Object.keys(patch).length) return settings()
+      const next = { ...cfg, ...patch }
+      mkdirSync(next.dir, { recursive: true })
+      mkdirSync(resolve(CONFIG_FILE, ".."), { recursive: true })
+      const temporary = `${CONFIG_FILE}.${randomUUID()}.tmp`
+      try {
+        writeFileSync(temporary, JSON.stringify({ dir: next.dir, auto_notify: next.autoNotify, auto_mirror: next.autoMirror, max_mbps: next.maxMbps, max_concurrent: next.maxConcurrent }, null, 2), { mode: 0o600 })
+        renameSync(temporary, CONFIG_FILE)
+      } finally { if (existsSync(temporary)) unlinkSync(temporary) }
+      Object.assign(cfg, patch)
+      pump()
+      return settings()
+    }
+
+    function setTaskRate(id: string, value: any) {
+      const t = tasks.get(id)
+      if (!t || t.kind !== "http" || terminal(t) || t.status === "verifying") throw new Error("Only queued/downloading HTTP tasks support rate changes")
+      t.limitBps = value === null ? undefined : rate(value)
+    }
 
     // 从工具 hook 捕获会话 ID（通知要用）
     ctx.tool.hook("execute.before", (event: any) => {
@@ -271,13 +329,22 @@ export default {
 
           const rs = Readable.fromWeb(res.body as any)
           const ws = createWriteStream(partial, { flags: "wx" })
-          const limit = t.limitBps ?? (cfg.maxMbps > 0 ? cfg.maxMbps * 1024 * 1024 : 0)
-          const t0 = Date.now()
-          let written = 0
           await pipeline(rs, async function* (source) {
             for await (const chunk of source) {
-              const buf = chunk as Buffer
-              written += buf.length
+              // Small slices bound bursts; short waits allow live rate changes and cancellation.
+              const data = chunk as Buffer
+              for (let offset = 0; offset < data.length; offset += 16 * 1024) {
+              const buf = data.subarray(offset, offset + 16 * 1024)
+              let remaining = buf.length
+              let previous = Date.now()
+              while (remaining > 0) {
+                const limit = t.limitBps ?? cfg.maxMbps * 1024 * 1024
+                if (!limit) break
+                await delay(Math.min(100, remaining / limit * 1000), undefined, { signal: ac.signal })
+                const now = Date.now()
+                remaining -= (now - previous) / 1000 * limit
+                previous = now
+              }
               t.received += buf.length
               hash.update(buf)
               const now = Date.now()
@@ -287,15 +354,8 @@ export default {
                 lastTick = now
                 lastBytes = t.received
               }
-              // 限速：按已写字节数追赶理论时间
-              if (limit > 0) {
-                const expectedMs = (written / limit) * 1000
-                const actualMs = Date.now() - t0
-                if (expectedMs > actualMs) {
-                  await delay(expectedMs - actualMs, undefined, { signal: ac.signal })
-                }
-              }
               yield buf
+              }
             }
           }, ws, { signal: ac.signal })
           ac.signal.throwIfAborted()
@@ -337,7 +397,7 @@ export default {
     }
 
     function pump() {
-      while (store.running < MAX_CONCURRENT) {
+      while (store.running < cfg.maxConcurrent) {
         const next = [...tasks.values()].find((t) => t.status === "queued")
         if (!next) break
         store.running++
@@ -400,17 +460,33 @@ h1{font-size:16px;margin:0;font-weight:600}
 button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:12px}
 button:hover{background:#30363d}
 .empty{color:#7d8590;text-align:center;padding:40px}
+input{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:5px;padding:7px;max-width:100%;box-sizing:border-box}.settings{display:flex;gap:14px;flex-wrap:wrap;align-items:end}.settings label{display:flex;flex-direction:column;gap:5px}.settings .path{flex:1;min-width:240px}.settings input[type=number]{width:120px}.rate{display:flex;gap:6px;align-items:center;margin-top:10px;flex-wrap:wrap}.rate input{width:110px}details{margin:16px 20px}summary{cursor:pointer;margin-bottom:12px}#feedback{color:#8b949e}
 </style></head><body>
 <header><span class="dot"></span><h1>opencode 下载器</h1><span id="sum" class="meta"></span></header>
+<details class="card" open><summary>设置 / Settings</summary><form id="settings" class="settings">
+<label class="path">下载目录 / Download directory<input id="dir" required></label>
+<label>并发数 / Concurrency<input id="concurrency" type="number" min="1" max="16" step="1" required></label>
+<label>默认单任务 MiB/s<input id="default-rate" type="number" min="0" step="any" required></label>
+<label><span>自动通知 / Notify</span><input id="notify" type="checkbox"></label>
+<label><span>GitHub 镜像 / Mirrors</span><input id="mirrors" type="checkbox"></label>
+<button type="submit">保存 / Save</button></form><p class="meta">0 = 不限速 / Unlimited · 默认限速对跟随默认设置的 HTTP 任务实时生效；Ollama 不适用。目录和镜像影响新任务。 / HTTP-only per-task limits; directory and mirrors apply to new tasks.</p><span id="feedback" role="status" aria-live="polite"></span></details>
 <div class="wrap" id="list"><div class="empty">暂无任务</div></div>
 <script>
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function h(n){if(!n||n<0)return '-';const u=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<3){n/=1024;i++}return n.toFixed(i?1:0)+' '+u[i]}
+let settingsLoaded=false;
+async function request(path,data){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});const d=await r.json();if(!r.ok)throw new Error(d.error||'Request failed');return d}
+function populate(c){document.getElementById('dir').value=c.dir;document.getElementById('concurrency').value=c.max_concurrent;document.getElementById('default-rate').value=c.max_mbps;document.getElementById('notify').checked=c.auto_notify;document.getElementById('mirrors').checked=c.auto_mirror}
+document.getElementById('settings').addEventListener('submit',async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const d=await request('/api/config',{dir:document.getElementById('dir').value,max_concurrent:Number(document.getElementById('concurrency').value),max_mbps:Number(document.getElementById('default-rate').value),auto_notify:document.getElementById('notify').checked,auto_mirror:document.getElementById('mirrors').checked});populate(d.config);document.getElementById('feedback').textContent='已保存 / Saved';await tick()}catch(e){document.getElementById('feedback').textContent=e.message}finally{b.disabled=false}});
+document.getElementById('list').addEventListener('submit',async e=>{const f=e.target.closest('form[data-rate]');if(!f)return;e.preventDefault();const value=f.querySelector('input').value;try{await request('/api/rate',{id:f.dataset.rate,max_mbps:value===''?null:Number(value)});document.getElementById('feedback').textContent='任务限速已更新 / Task limit updated';f.dataset.dirty='';document.activeElement.blur();await tick()}catch(e){document.getElementById('feedback').textContent=e.message}});
+document.getElementById('list').addEventListener('input',e=>{const f=e.target.closest('form[data-rate]');if(f)f.dataset.dirty='true'});
 async function tick(){
   try{
     const r=await fetch('/api/tasks');const d=await r.json();
     const list=document.getElementById('list');
-    document.getElementById('sum').textContent='共 '+d.tasks.length+' 个任务 · 目录 '+d.dir;
+    if(!settingsLoaded){populate(d.config);settingsLoaded=true}
+    document.getElementById('sum').textContent=d.running+' / '+d.config.max_concurrent+' 运行 / Running · '+d.tasks.length+' 任务 / Tasks';
+    if(list.contains(document.activeElement)||list.querySelector('[data-dirty="true"]'))return;
     if(!d.tasks.length){list.innerHTML='<div class="empty">暂无任务</div>';return}
     list.innerHTML=d.tasks.map(t=>{
       const pct=t.total?Math.min(100,t.received/t.total*100):0;
@@ -418,6 +494,7 @@ async function tick(){
        return '<div class="card"><div class="row"><div><div class="name">'+esc(t.name)+'</div><div class="u">'+esc(t.url)+'</div></div><span class="st '+esc(t.status)+'">'+esc(t.status)+'</span></div>'
       +'<div class="bar"><div class="fill" style="width:'+pct.toFixed(1)+'%"></div></div>'
        +'<div class="meta"><span>'+h(t.received)+(t.total?' / '+h(t.total):'')+'</span><span>'+h(t.speed)+'/s</span><span>剩余 '+et+'</span><span>'+(t.error?'⚠ '+esc(t.error.slice(0,160)):'')+'</span></div>'
+       +(t.kind==='http'&&['queued','downloading'].includes(t.status)?'<form class="rate" data-rate="'+esc(t.id)+'"><label>MiB/s <input aria-label="任务限速 / Task rate" type="number" min="0" step="any" placeholder="默认 / Default" value="'+(t.limitBps===undefined?'':t.limitBps/1048576)+'"></label><button type="submit">应用 / Apply</button><span class="meta">留空跟随默认 / Blank inherits default</span></form>':t.kind==='ollama'?'<p class="meta">Ollama（可选 / Optional）· 限速由 Ollama 管理 / Rate managed by Ollama</p>':'')
        +'<div style="margin-top:8px;display:flex;gap:6px">'+(['queued','downloading','verifying'].includes(t.status)?'<button data-action="cancel" data-id="'+esc(t.id)+'">取消 / Cancel</button>':'')+(['failed','canceled'].includes(t.status)?'<button data-action="retry" data-id="'+esc(t.id)+'">重试 / Retry</button>':'')+(['done','failed','canceled'].includes(t.status)?'<button data-action="remove" data-id="'+esc(t.id)+'">删除 / Remove</button>':'')+'</div></div>'
     }).join('');
    }catch(e){document.getElementById('sum').textContent='连接失败 / Connection lost'}
@@ -432,7 +509,7 @@ tick();setInterval(tick,1000);
       try {
         store.server?.close()
       } catch {}
-      store.server = createServer((req: any, res: any) => {
+      store.server = createServer(async (req: any, res: any) => {
         const origin = `http://127.0.0.1:${cfg.guiPort}`
         res.setHeader("cache-control", "no-store")
         res.setHeader("x-content-type-options", "nosniff")
@@ -447,7 +524,21 @@ tick();setInterval(tick,1000);
         }
         if (u.pathname === "/api/tasks") {
           res.writeHead(200, { "content-type": "application/json; charset=utf-8" })
-          res.end(JSON.stringify({ dir: cfg.dir, tasks: [...tasks.values()] }))
+          res.end(JSON.stringify({ dir: cfg.dir, config: settings(), running: store.running, tasks: [...tasks.values()] }))
+          return
+        }
+        if (u.pathname === "/api/config" || u.pathname === "/api/rate") {
+          if (req.method === "GET" && u.pathname === "/api/config") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ config: settings() })); return }
+          if (req.method !== "POST") { res.writeHead(405, { allow: "POST" }); res.end("Method not allowed"); return }
+          try {
+            if (!(req.headers["content-type"] || "").startsWith("application/json")) throw new Error("JSON content type required")
+            let body = ""
+            for await (const chunk of req) { body += chunk.toString(); if (Buffer.byteLength(body) > 8192) throw new Error("Request too large") }
+            const input = JSON.parse(body)
+            if (u.pathname === "/api/config") configure(input)
+            else { if (!input || typeof input.id !== "string" || !("max_mbps" in input)) throw new Error("Invalid task rate request"); setTaskRate(input.id, input.max_mbps) }
+            res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, config: settings() }))
+          } catch (error: any) { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: error.message })) }
           return
         }
         if (u.pathname === "/api/cancel" || u.pathname === "/api/retry" || u.pathname === "/api/remove") {
@@ -487,7 +578,7 @@ tick();setInterval(tick,1000);
             dir: { type: "string", description: "保存目录（默认 用户\\Downloads\\opencode-dl）" },
             sha256: { type: "string", description: "可选：校验用的 sha256" },
             mirror: { type: "boolean", description: "失败时自动尝试 GitHub 镜像（默认开）" },
-            max_mbps: { type: "number", description: "该任务限速（MB/s），省略则用全局设置；0=不限" },
+            max_mbps: { type: "number", minimum: 0, description: "HTTP 单任务限速（MiB/s），省略跟随默认；0=不限" },
           },
           required: ["url"],
           additionalProperties: false,
@@ -575,8 +666,8 @@ tick();setInterval(tick,1000);
             content: [...tasks.values()]
               .map((t) => {
                 const pct = t.total ? ((t.received / t.total) * 100).toFixed(1) + "%" : "-"
-                const limit = t.limitBps ?? (cfg.maxMbps > 0 ? cfg.maxMbps * 1024 * 1024 : 0)
-                return `[${t.id}] ${t.name}\n  ${t.status} ${pct} ${human(t.received)}${t.total ? "/" + human(t.total) : ""} ${t.speed ? human(t.speed) + "/s 剩余 " + eta(t) : ""}${limit ? ` · 限速 ${(limit / 1024 / 1024).toFixed(1)} MB/s` : ""}${t.error ? "\n  ⚠ " + t.error : ""}${t.notifyResult ? "\n  通知: " + t.notifyResult : ""}`
+                const limit = t.kind === "http" ? t.limitBps ?? cfg.maxMbps * 1024 * 1024 : 0
+                return `[${t.id}] ${t.name}\n  ${t.status} ${pct} ${human(t.received)}${t.total ? "/" + human(t.total) : ""} ${t.speed ? human(t.speed) + "/s 剩余 " + eta(t) : ""}${limit ? ` · 限速 ${(limit / 1024 / 1024).toFixed(3)} MiB/s` : ""}${t.error ? "\n  ⚠ " + t.error : ""}${t.notifyResult ? "\n  通知: " + t.notifyResult : ""}`
               })
               .join("\n"),
           }
@@ -656,29 +747,27 @@ tick();setInterval(tick,1000);
 
       editor.add({
         name: "config",
-        description: "查看或修改下载器配置。",
+        description: "查看或持久化下载器配置：目录、并发数（1–16）、实时 HTTP 默认单任务限速、自动通知、镜像。",
         input: {
           type: "object",
           properties: {
             dir: { type: "string" },
             auto_notify: { type: "boolean", description: "下载完成后是否自动唤醒 agent" },
             auto_mirror: { type: "boolean", description: "失败时是否自动尝试镜像" },
-            max_mbps: { type: "number", description: "全局限速（MB/s），0=不限速" },
+            max_mbps: { type: "number", minimum: 0, description: "默认 HTTP 单任务限速（MiB/s），实时生效；0=不限" },
+            max_concurrent: { type: "integer", minimum: 1, maximum: 16, description: "最大并发任务数（1–16），默认3" },
           },
           additionalProperties: false,
         },
         options: { namespace: "dl", codemode: true },
         execute: async (input: any) => {
-          if (input?.max_mbps !== undefined) rate(input.max_mbps)
-          if (input?.dir) { const dir = resolve(String(input.dir)); mkdirSync(dir, { recursive: true }); cfg.dir = dir }
-          if (typeof input?.auto_notify === "boolean") cfg.autoNotify = input.auto_notify
-          if (typeof input?.auto_mirror === "boolean") cfg.autoMirror = input.auto_mirror
-          if (typeof input?.max_mbps === "number") cfg.maxMbps = Math.max(0, input.max_mbps)
-          return { content: "当前配置：\n" + JSON.stringify(cfg, null, 2) }
+          return { content: "当前配置：\n" + JSON.stringify(configure(input || {}), null, 2) }
         },
       })
     })
 
+    // Rebind the panel handler on reload while keeping in-flight tasks and their settings.
+    if (store.server?.listening) await new Promise<void>((done) => store.server.close(() => done()))
     startGui()
     // GUI 服务器是跨重载共享的，插件重载时不关闭，保证面板一直可用
     return () => {}

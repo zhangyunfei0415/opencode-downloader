@@ -16,7 +16,7 @@
 
 ### 功能
 
-- HTTP/HTTPS 文件下载，最多同时运行 3 个任务。
+- HTTP/HTTPS 文件下载，并发数可设为 1～16，默认 3。
 - 自定义目录、文件名、SHA-256 校验和限速。
 - 独立 `.part` 临时文件，成功后发布成品，不覆盖已有文件。
 - GitHub 下载可尝试原地址及 3 个第三方镜像，可按任务关闭。
@@ -59,7 +59,7 @@
 }
 ```
 
-默认目录是 `~/Downloads/opencode`。`max_mbps` 单位为 **MiB/s**（每秒 1024² 字节），`0` 不限速。校验参数 `sha256` 应为 64 位十六进制字符串。
+默认目录是 `~/Downloads/opencode-dl`。`max_mbps` 单位为 **MiB/s**（每秒 1024² 字节），`0` 不限速。校验参数 `sha256` 应为 64 位十六进制字符串。
 
 用 `dl.open` 打开面板，或访问 <http://127.0.0.1:17890/>。Windows/macOS/Linux 分别使用系统 `start`、`open`、`xdg-open`；没有启动命令时可手动访问地址。
 
@@ -73,7 +73,19 @@
 | `dl.remove` | 用 `id` 移除已结束任务的记录，保留成品 |
 | `dl.clear` | 清除已结束任务的记录，保留成品 |
 | `dl.open` | 打开本地面板 |
-| `dl.config` | 设置默认 `dir`、`auto_notify`、`auto_mirror`、`max_mbps` |
+| `dl.config` | 设置默认 `dir`、`auto_notify`、`auto_mirror`、`max_mbps`、`max_concurrent` |
+
+### 网页设置
+
+![网页设置 / Dashboard settings](docs/settings.png)
+
+面板顶部可设置下载目录、并发任务数、默认 HTTP 单任务限速、自动通知和 GitHub 镜像回退。点击“保存”后，设置写入 `~/.config/opencode/downloader.json`，重启后恢复；环境变量 `OPENCODE_DOWNLOADER_CONFIG` 可指定其他配置路径。
+
+- 并发数范围 1～16，HTTP 和 Ollama 共用名额。增加上限立即调度排队任务；降低上限不终止正在运行的任务。
+- 默认限速实时作用于未设置独立限速的 HTTP 任务，**不是全部任务共享的总带宽上限**。
+- 每个排队或下载中的 HTTP 任务可设置独立限速；留空并点击“应用”可恢复跟随默认，填 `0` 为不限速。
+- 目录和镜像设置影响新任务；自动通知设置在任务结束时生效。
+- **Ollama 是可选功能**，无需安装即可使用普通文件下载；模型拉取不应用 HTTP 限速。
 
 ### 行为与限制
 
@@ -107,7 +119,7 @@ A local plugin for [OpenCode V2](https://opencode.ai/v2/docs/build/plugins). An 
 
 ### Features
 
-- HTTP/HTTPS downloads with up to three concurrent tasks.
+- HTTP/HTTPS downloads with configurable concurrency from 1 to 16 (default 3).
 - Custom directories and filenames, SHA-256 verification, and rate limits.
 - Separate `.part` files, with completed files published without overwriting existing destinations.
 - Optional GitHub fallback through the original URL and three third-party mirrors, configurable per task.
@@ -149,7 +161,7 @@ Or request `dl.add` with arguments such as:
 }
 ```
 
-The default directory is `~/Downloads/opencode`. `max_mbps` uses **MiB/s** (1024² bytes per second); `0` means unlimited. Supply a 64-character hexadecimal `sha256` to verify a file.
+The default directory is `~/Downloads/opencode-dl`. `max_mbps` uses **MiB/s** (1024² bytes per second); `0` means unlimited. Supply a 64-character hexadecimal `sha256` to verify a file.
 
 Use `dl.open` or visit <http://127.0.0.1:17890/>. Browser launching uses `start` on Windows, `open` on macOS, and `xdg-open` on Linux. Open the URL manually if a launch command is unavailable.
 
@@ -163,7 +175,17 @@ Use `dl.open` or visit <http://127.0.0.1:17890/>. Browser launching uses `start`
 | `dl.remove` | Remove a finished task record by `id`, keeping its file |
 | `dl.clear` | Remove finished task records, keeping downloaded files |
 | `dl.open` | Open the dashboard |
-| `dl.config` | Set default `dir`, `auto_notify`, `auto_mirror`, and `max_mbps` |
+| `dl.config` | Set default `dir`, `auto_notify`, `auto_mirror`, `max_mbps`, and `max_concurrent` |
+
+### Dashboard settings
+
+Use the settings form to change the directory, concurrency, default HTTP per-task rate, notifications, and GitHub mirror fallback. Saving persists settings to `~/.config/opencode/downloader.json`, restored on restart. Set `OPENCODE_DOWNLOADER_CONFIG` to use a different configuration path.
+
+- Concurrency ranges from 1 to 16, shared by HTTP and Ollama tasks. Raising it immediately starts queued tasks; lowering it never interrupts active tasks.
+- The default rate applies live to HTTP tasks without overrides. It is **not an aggregate bandwidth cap**.
+- Queued/downloading HTTP tasks have individual rate controls. Leave the field blank and click Apply to inherit the default; `0` means unlimited.
+- Directory and mirror changes affect new tasks. Notification settings are checked when a task finishes.
+- **Ollama is optional**; ordinary file downloads do not require it. HTTP rate limits do not apply to model pulls.
 
 ### Behavior and limitations
 
