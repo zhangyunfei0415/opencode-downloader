@@ -1,0 +1,16 @@
+# 依赖（本项目零依赖，但仍忽略以防万一）
+node_modules/
+
+# 下载产物
+downloads/
+*.gguf
+*.exe
+*.zip
+*.tar.gz
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

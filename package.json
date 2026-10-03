@@ -1,0 +1,48 @@
+{
+  "name": "opencode-downloader",
+  "version": "1.1.0",
+  "description": "Backend downloader plugin for OpenCode with a web progress panel and automatic AI wake-up on completion",
+  "type": "module",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "downloader",
+    "download-manager",
+    "progress",
+    "ollama",
+    "ai-agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhangyunfei0415/opencode-downloader.git"
+  },
+  "homepage": "https://github.com/zhangyunfei0415/opencode-downloader#readme",
+  "bugs": {
+    "url": "https://github.com/zhangyunfei0415/opencode-downloader/issues"
+  },
+  "files": [
+    "downloader.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
